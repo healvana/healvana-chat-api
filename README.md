@@ -17,21 +17,48 @@ Key features include:
 ## Prerequisites
 
 - **Docker and Docker Compose**: For running the application and its dependencies (Ollama).
-- **Ollama**: Installed and running, with the desired LLM model pulled (e.g., `ollama pull qwen2:0.5b` or `ollama pull llama3`). The model name needs to be configured via an environment variable.
+- **Ollama**: Installed and running, with the desired LLM model pulled (e.g., `ollama pull llama3.2:3b-instruct-q5_K_M` or `ollama pull llama3.2:3b-instruct-q5_K_M`). The model name needs to be configured via an environment variable.
 - **Python 3.9+** (if running outside Docker for development).
 - **Poetry** (if running outside Docker for Python dependency management).
 
 ## Project Structure (Assumed)
 
-.├── docker-compose.yml├── langchain/             # This FastAPI application│   ├── serve.py           # Main FastAPI application code│   ├── Dockerfile│   ├── poetry.lock│   └── pyproject.toml├── ollama/                # Ollama Docker setup (if custom)│   └── Dockerfile└── .env                   # Environment variable configuration (optional, can be passed via docker-compose)
+```bash
+├── README.md
+├── docker-compose.yml
+├── langchain
+│   ├── Dockerfile
+│   ├── poetry.lock
+│   ├── pyproject.toml
+│   ├── requirements.txt
+│   └── serve.py
+├── ollama
+│   ├── Dockerfile
+│   └── start-ollama.sh
+└── web
+    ├── Dockerfile
+    ├── package-lock.json
+    ├── package.json
+    ├── src
+    │   ├── app.d.ts
+    │   ├── app.html
+    │   └── routes
+    │       ├── +layout.ts
+    │       └── +page.svelte
+    ├── static
+    │   └── favicon.png
+    ├── svelte.config.js
+    ├── tsconfig.json
+    └── vite.config.ts
+```
 ## Setup and Running the API
 
 The primary method for running this API is using Docker Compose, which manages the FastAPI application and the Ollama service.
 
 1.  **Clone the Repository (if applicable)**
     ```bash
-    # git clone <your-repo-url>
-    # cd <your-repo-directory>
+    # git clone git@github.com:healvana/healvana-chat-api.git
+    # cd healvana-chat-api
     ```
 
 2.  **Configure Environment Variables**:
@@ -39,7 +66,7 @@ The primary method for running this API is using Docker Compose, which manages t
 
     ```env
     # .env file
-    OLLAMA_MODEL=qwen2:0.5b # Replace with your desired Ollama model (e.g., llama3:8b-instruct)
+    OLLAMA_MODEL=llama3.2:3b-instruct-q5_K_M # Replace with your desired Ollama model (e.g., llama3:8b-instruct)
     # OLLAMA_HOST=ollama    # Already set in docker-compose.yml for langchain service
     # OLLAMA_PORT=11434   # Already set in docker-compose.yml for langchain service
     OLLAMA_TEMPERATURE=0.2  # LLM generation temperature
@@ -62,7 +89,7 @@ The primary method for running this API is using Docker Compose, which manages t
 
 The application uses the following environment variables for configuration:
 
--   `OLLAMA_MODEL` (Required): The name of the Ollama model to use (e.g., `qwen2:0.5b`, `llama3:latest`).
+-   `OLLAMA_MODEL` (Required): The name of the Ollama model to use (e.g., `llama3.2:3b-instruct-q5_K_M`, `llama3.2:3b-instruct-q5_K_M`).
 -   `OLLAMA_HOST` (Optional, Default: `ollama`): The hostname for the Ollama service. Used if `OLLAMA_BASE_URL` is not set.
 -   `OLLAMA_PORT` (Optional, Default: `11434`): The port for the Ollama service. Used if `OLLAMA_BASE_URL` is not set.
 -   `OLLAMA_BASE_URL` (Optional): The full base URL for the Ollama API (e.g., `http://my-custom-ollama:11434`). If set, this overrides `OLLAMA_HOST` and `OLLAMA_PORT`.
@@ -89,7 +116,7 @@ The API documentation (Swagger UI) is available at `http://localhost:8000/docs` 
     ```json
     {
       "status": "ok",
-      "model_name": "qwen2:0.5b",
+      "model_name": "llama3.2:3b-instruct-q5_K_M",
       "ollama_url_used": "http://ollama:11434",
       "ollama_temperature": 0.2
     }
