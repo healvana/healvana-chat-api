@@ -1,0 +1,47 @@
+services:
+  ollama:
+    build:
+      context: ./ollama
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - app-network
+    environment:
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
+
+  langchain:
+    build:
+      context: ./langchain
+    volumes:
+      - ./langchain:/app
+    networks:
+      - app-network
+    depends_on:
+      - ollama
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - OLLAMA_HOST=ollama
+      - OLLAMA_PORT=11434
+    command: poetry run python serve.py
+
+  web:
+    build: ./web
+    ports:
+      - "8087:80"
+    depends_on:
+      - langchain
+    networks:
+      - app-network
+    environment:
+      - VITE_API_HOST=langchain
+
+networks:
+  app-network:
+
+
+volumes:
+  ollama:

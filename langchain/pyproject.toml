@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "langchain-Chat"
+version = "0.1.0"
+description = ""
+authors = ["Gautam Dudeja"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+langchain-ollama = "^0.2.0"
+langchain-core = "^0.3.6"
+langserve = "^0.3.0"
+fastapi = "^0.115.0"
+sse-starlette = "^2.1.3"
+langchain = "0.3.25"
+pydantic-settings = "^2.9.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
