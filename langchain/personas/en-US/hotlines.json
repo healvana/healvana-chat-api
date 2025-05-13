@@ -1,0 +1,17 @@
+[
+  {
+    "name": "988 Suicide & Crisis Lifeline (USA)",
+    "contact": "Call or text 988",
+    "description": "Provides 24/7, free and confidential support for people in distress, prevention and crisis resources for you or your loved ones."
+  },
+  {
+    "name": "Crisis Text Line (USA)",
+    "contact": "Text HOME to 741741",
+    "description": "Offers free, 24/7 confidential crisis support via text message."
+  },
+  {
+    "name": "Emergency Services (USA)",
+    "contact": "911 or nearest emergency room",
+    "description": "For immediate life-threatening emergencies."
+  }
+]

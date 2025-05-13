@@ -1,120 +1,136 @@
 import os
 import logging
 import uvicorn
+import json
+from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Dict, AsyncGenerator, Optional, List
+from typing import Dict, AsyncGenerator, Optional, List, Any, Tuple
 
-from fastapi import FastAPI, HTTPException, Body, Path
+from fastapi import FastAPI, HTTPException, Body, Path as FastApiPath  # Renamed Path to avoid conflict
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings
 
+# Langchain Imports
 from langchain_ollama.llms import OllamaLLM
-from langchain.memory import ConversationBufferMemory
+from langchain_community.embeddings import OllamaEmbeddings  # Use community for embeddings
 from langchain.schema import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+
+# --- Constants ---
+PERSONA_DIR = Path("personas")  # Expects 'personas' directory in the same location as serve.py
+DOCUMENTS_DIR = Path("documents")  # Expects 'documents' directory in the same location as serve.py
 
 
-# --- Configuration ---
+# --- Persona and Localization Configuration ---
+
+class CrisisHotline(BaseModel):
+    name: str
+    contact: str
+    description: Optional[str] = None
+
+
+class PersonaConfig(BaseModel):
+    locale_id: str = Field(..., description="Locale identifier (e.g., en-US, es-ES)")
+    persona_name: str = Field(..., description="Display name for the persona")
+    system_prompt: str = Field(..., description="The detailed system prompt for the LLM.")
+    initial_greeting: str = Field(..., description="The first message the AI sends.")
+    crisis_hotlines: List[CrisisHotline] = Field(default_factory=list)
+
+
+def load_persona_config(locale_id: str) -> Optional[PersonaConfig]:
+    """Loads persona configuration from files for a given locale."""
+    # Assumes PERSONA_DIR is relative to the current working directory of serve.py
+    # When running in Docker, this will be /app/personas if ./langchain is mounted to /app
+    current_script_dir = Path(__file__).parent
+    locale_path = current_script_dir / PERSONA_DIR / locale_id
+
+    if not locale_path.is_dir():
+        logger.warning(f"Locale directory not found: {locale_path}")
+        return None
+
+    try:
+        system_prompt_file = locale_path / "system.prompt"
+        greeting_file = locale_path / "greeting.txt"
+        hotlines_file = locale_path / "hotlines.json"
+
+        system_prompt = system_prompt_file.read_text(encoding="utf-8") if system_prompt_file.exists() else \
+            "You are a helpful assistant. Please keep your responses concise."
+        initial_greeting = greeting_file.read_text(encoding="utf-8") if greeting_file.exists() else \
+            "Hello! How can I assist you today?"
+
+        hotlines_data = []
+        if hotlines_file.exists():
+            with open(hotlines_file, 'r', encoding='utf-8') as f:
+                hotlines_raw = json.load(f)
+                if isinstance(hotlines_raw, list):
+                    hotlines_data = [CrisisHotline(**item) for item in hotlines_raw]
+        else:
+            logger.warning(f"Hotlines file not found for locale '{locale_id}': {hotlines_file}")
+
+        persona_name = f"Healvana ({locale_id})"
+
+        return PersonaConfig(
+            locale_id=locale_id,
+            persona_name=persona_name,
+            system_prompt=system_prompt,
+            initial_greeting=initial_greeting,
+            crisis_hotlines=hotlines_data
+        )
+    except Exception as e:
+        logger.error(f"Error loading persona config for locale '{locale_id}' from {locale_path}: {e}")
+        return None
+
+
+def load_all_personas() -> Dict[str, PersonaConfig]:
+    """Loads all persona configurations from the persona directory."""
+    personas = {}
+    current_script_dir = Path(__file__).parent
+    effective_persona_dir = current_script_dir / PERSONA_DIR
+
+    if not effective_persona_dir.is_dir():
+        logger.warning(
+            f"Persona directory '{effective_persona_dir}' not found. Ensure it exists and is populated relative to serve.py.")
+        return personas
+
+    for locale_dir in effective_persona_dir.iterdir():
+        if locale_dir.is_dir():
+            locale_id = locale_dir.name
+            config = load_persona_config(locale_id)  # load_persona_config now uses absolute path based on script dir
+            if config:
+                personas[locale_id] = config
+    if not personas:
+        logger.warning(f"No persona configurations were loaded from {effective_persona_dir}.")
+    return personas
+
+
+# --- Application Settings ---
 class Settings(BaseSettings):
-    """Manages application settings using environment variables."""
-    ollama_model: str = Field(..., description="Name of the Ollama model to use.", validation_alias='OLLAMA_MODEL')
-
-    ollama_base_url_env: Optional[str] = Field(default=None, description="Optional: Full base URL for Ollama.",
-                                               validation_alias='OLLAMA_BASE_URL')
-    ollama_host: str = Field(default="ollama", description="Hostname for the Ollama service.",
-                             validation_alias='OLLAMA_HOST')
-    ollama_port: int = Field(default=11434, description="Port for the Ollama service.", validation_alias='OLLAMA_PORT')
-    ollama_temperature: float = Field(default=0.2, description="Temperature for Ollama LLM generation.",
-                                      validation_alias='OLLAMA_TEMPERATURE')
+    ollama_model: str = Field(..., validation_alias='OLLAMA_MODEL')
+    ollama_base_url_env: Optional[str] = Field(default=None, validation_alias='OLLAMA_BASE_URL')
+    ollama_host: str = Field(default="ollama", validation_alias='OLLAMA_HOST')
+    ollama_port: int = Field(default=11434, validation_alias='OLLAMA_PORT')
+    ollama_temperature: float = Field(default=0.2, validation_alias='OLLAMA_TEMPERATURE')
+    embeddings_model: str = Field(default="nomic-embed-text", description="Default Ollama model for embeddings.",
+                                  validation_alias='EMBEDDINGS_MODEL')
+    # Add option to control whether RAG is enabled by default
+    enable_rag_by_default: bool = Field(default=True, validation_alias='ENABLE_RAG_BY_DEFAULT')
 
     actual_ollama_base_url: Optional[str] = None
-
-    app_title: str = "Comprehensive LangChain Chat API with Healvana Persona"
-    app_version: str = "1.3.0"  # Updated version for more APIs
+    app_title: str = "Global Healvana Chat API with RAG"
+    app_version: str = "2.2.0"  # Updated version for RAG option
     log_level: str = "INFO"
+    default_locale: str = Field(default="en-US")
 
-    # Healvana Psychiatrist Persona Configuration - Reinforced
-    healvana_system_prompt: str = (
-        "You are Healvana, a professional psychiatrist and mental health specialist. "
-        "**Your responses MUST be very short and concise, typically 10-15 words MAXIMUM, and usually a question to guide the conversation.** "  # Reinforced instruction
-        "Maintain a conversational flow. Talk to the user as if you genuinely care. Use clinical language balanced with warm, accessible explanations. "
-        "You have extensive clinical experience treating various mental health conditions and are trained in evidence-based therapeutic approaches.\n\n"
-        "CLINICAL REFERENCE KNOWLEDGE:\n"
-        "You have expertise in treating conditions including:\n"
-        "- Work stress and social isolation (like case of Mr. J, 30-year-old engineer with remote work challenges)\n"
-        "- Low self-esteem and negative self-perception (like case of Mr. B, 35-year-old who attributes success to luck)\n"
-        "- Depression with motivational issues (like case of Ms. J, 32-year-old with anhedonia and self-critical thoughts)\n"
-        "- Social anxiety and specific phobias (like case of Mr. GB, 23-year-old with situational anxiety)\n"
-        "- Major depressive disorder with suicidal ideation (like case of Mr. I with pessimistic outlook)\n"
-        "- Generalized anxiety disorder (like case of Mr. X with excessive worry after father's death)\n"
-        "- Complicated grief and bereavement (like case of Ms. T after stillbirth experience)\n"
-        "- Panic disorder with physical symptoms (like case of Ms. S with catastrophic misinterpretation)\n"
-        "- Mixed anxiety and depression (like case of Ms. P with somatic symptoms)\n\n"
-        "STRUCTURED ASSESSMENT APPROACH:\n"
-        "1. Begin with a warm greeting and brief explanation of the assessment process.\n"
-        "2. Conduct a PHQ-2 screen for depression (interest/pleasure in activities and feeling down/hopeless).\n"
-        "3. Conduct a GAD-2 screen for anxiety (nervousness/anxiety and worry).\n"
-        "4. Explore sleep patterns and any changes.\n"
-        "5. Inquire about appetite or weight changes.\n"
-        "6. Assess energy levels and fatigue.\n"
-        "7. Explore social support systems and relationships.\n"
-        "8. Screen for self-harm or suicidal thoughts with appropriate protocols.\n\n"
-        "EVIDENCE-BASED THERAPEUTIC TECHNIQUES:\n"
-        "For depression symptoms:\n"
-        "- Behavioral activation: Start with small, manageable activities that provide pleasure or a sense of achievement (like walking with a friend for 5-10 minutes as with Ms. M).\n"
-        "- Activity scheduling with mood rating (as used with Ms. J).\n"
-        "- Thought record work to identify and challenge negative thoughts (Date|Situation|Thought|Emotion|Behavior format).\n"
-        "- Identifying cognitive distortions like mind reading, emotional reasoning, catastrophizing, and overgeneralization.\n"
-        "For anxiety symptoms:\n"
-        "- Deep breathing exercises (5-10 minutes when first noticing anxiety symptoms).\n"
-        "- Progressive muscle relaxation before sleep (as used with Mr. X).\n"
-        "- Cognitive restructuring with evidence for and against anxious predictions.\n"
-        "- Gradual exposure to feared situations while using relaxation techniques.\n"
-        "- Identifying and replacing anxious automatic thoughts.\n"
-        "For interpersonal issues:\n"
-        "- Problem-solving approach: Identify issue, brainstorm solutions, evaluate pros/cons, implement best option (as with Mr. J).\n"
-        "- Assertiveness training with \"I\" statements (as used with Ms. K).\n"
-        "- Role-playing difficult conversations (as used with Ms. T for grief communication).\n"
-        "- Social reconnection strategies (like Mr. J reaching out to old friends).\n"
-        "For self-esteem and self-criticism:\n"
-        "- Strength identification and tracking daily use of strengths (as with Mr. B).\n"
-        "- Self-compassion letter writing exercise (as with Mr. B).\n"
-        "- Savoring positive experiences technique (as with Mr. B and Mr. J).\n"
-        "- Challenging unrealistic expectations and perfectionism.\n\n"
-        "SESSION STRUCTURE MODEL:\n"
-        "1. Open with \"How have you been feeling since we last spoke?\" or \"How has your week been?\"\n"
-        "2. Review previously suggested techniques and homework assignments\n"
-        "4. Introduce one new concept or technique with clear rationale\n"
-        "5. Practice the technique during session when possible\n"
-        "6. Assign specific, achievable homework (thought records, relaxation practice, etc.)\n\n"
-        "RISK ASSESSMENT PROTOCOL:\n"
-        "For suicidal ideation or self-harm:\n"
-        "1. Directly address concerning statements and assess risk level\n"
-        "2. Provide immediate crisis resources:\n"
-        "   - 988 Suicide & Crisis Lifeline: Call or text 988\n"
-        "   - Crisis Text Line: Text HOME to 741741\n"
-        "   - Emergency Services: 911 or nearest emergency room\n"
-        "3. Advise against staying alone if at high risk\n"
-        "5. Continue to monitor risk in follow-up conversations\n\n"
-        "INTERACTION GUIDELINES:\n"
-        "- **Your response MUST be very short and concise, typically 10-15 words MAXIMUM, and usually a question.**\n"  # Reinforced instruction
-        "- Talk to me like you care.\n"
-        "- Use clinical language balanced with warm, accessible explanations\n"
-        "- Ask about symptom duration, severity, context, and history\n"
-        "- Use validation statements frequently: \"That sounds difficult\" or \"I understand how that could be overwhelming\"\n"
-        "- Use Socratic questioning to help challenge thoughts: \"What evidence supports this thought?\" \"What evidence contradicts it?\"\n"
-        "- Progress gradually from simpler to more complex techniques\n"
-        "- Space sessions further apart as improvement occurs\n\n"
-        "IMPORTANT ETHICAL BOUNDARIES:\n"
-        "- Balance clinical assessment with empathy and support\n\n"
-        "Begin with a warm welcome and open-ended question about current feelings, then gradually move into structured assessment based on their initial response. **Remember to keep your responses very short (10-15 words max) and ask guiding questions.**"
-    )
-    healvana_initial_greeting: str = (
-        "Hello, I'm Healvana, a mental wellness companion. I'd like to help understand how you've been feeling recently. "
-        "Over the next few minutes, I'll ask you some standard questions that mental health professionals typically use in assessments. "
-        "This helps provide more structured support, though it's not a replacement for professional care. How have you been feeling lately?"
-    )
+    personas: Dict[str, PersonaConfig] = Field(default_factory=load_all_personas)
 
     @model_validator(mode='after')
     def assemble_ollama_url(self) -> 'Settings':
@@ -124,39 +140,61 @@ class Settings(BaseSettings):
             self.actual_ollama_base_url = f"http://{self.ollama_host}:{self.ollama_port}"
         return self
 
+    def get_persona_config(self, locale: Optional[str]) -> PersonaConfig:
+        target_locale = locale or self.default_locale
+        persona = self.personas.get(target_locale)
+        if not persona:
+            logger.warning(
+                f"Persona for locale '{target_locale}' not found. Falling back to default '{self.default_locale}'.")
+            persona = self.personas.get(self.default_locale)
+            if not persona:
+                logger.error(f"CRITICAL: Default persona '{self.default_locale}' not found in loaded configurations!")
+                return PersonaConfig(
+                    locale_id=self.default_locale,
+                    persona_name="Healvana (Emergency Fallback)",
+                    system_prompt="You are a helpful assistant. Please be concise.",
+                    initial_greeting="Hello! How can I help you today?",
+                    crisis_hotlines=[]
+                )
+        return persona
+
     class Config:
         env_file = '.env'
         extra = 'ignore'
 
 
-# --- Logging Setup ---
+# --- Logging, Globals ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Global Variables & Initialization ---
 try:
     settings = Settings()
     logging.getLogger().setLevel(settings.log_level.upper())
-    if settings.ollama_base_url_env:
-        logger.info(f"Using OLLAMA_BASE_URL: {settings.actual_ollama_base_url}")
-    else:
-        logger.info(
-            f"Constructed Ollama URL from OLLAMA_HOST ({settings.ollama_host}) and OLLAMA_PORT ({settings.ollama_port}): {settings.actual_ollama_base_url}")
-    logger.info(f"Ollama Temperature: {settings.ollama_temperature}")
-
+    logger.info(f"Default locale set to: {settings.default_locale}")
+    logger.info(f"Loaded {len(settings.personas)} personas: {list(settings.personas.keys())}")
+    logger.info(f"RAG enabled by default: {settings.enable_rag_by_default}")
+    if not settings.personas.get(settings.default_locale):
+        logger.error(
+            f"Default persona for locale '{settings.default_locale}' failed to load. API might not function as expected.")
+    elif not settings.personas:
+        logger.warning(f"No personas loaded. Check '{Path(__file__).parent / PERSONA_DIR}' directory.")
 
 except Exception as e:
-    logger.exception("Failed to initialize settings. Ensure OLLAMA_MODEL is set.")
+    logger.exception("Failed to initialize settings.")
     raise SystemExit(f"Configuration error: {e}")
 
-session_memories: Dict[str, ConversationBufferMemory] = {}
 llm: Optional[OllamaLLM] = None
+embeddings: Optional[OllamaEmbeddings] = None
+vector_store: Optional[FAISS] = None
+retriever: Optional[Any] = None
+# rag_chain is now assembled per request due to locale-specific system prompts
+
+session_histories: Dict[str, List[BaseMessage]] = {}
 
 
 # --- Pydantic Models for API ---
 class MessageOutput(BaseModel):
-    """Model for representing a single message in the history."""
-    type: str  # 'human', 'ai', 'system'
+    type: str
     content: str
 
     @classmethod
@@ -166,16 +204,21 @@ class MessageOutput(BaseModel):
 
 class SessionHistoryResponse(BaseModel):
     session_id: str
+    locale_used: str
     history: List[MessageOutput]
 
 
-class PersonaConfigResponse(BaseModel):
-    system_prompt: str
-    initial_greeting: str
+class PersonaInfo(BaseModel):
+    locale_id: str
+    persona_name: str
+
+
+class PersonaDetailResponse(PersonaConfig): pass
 
 
 class InitialGreetingResponse(BaseModel):
     session_id: str
+    locale_used: str
     greeting: str
 
 
@@ -185,71 +228,149 @@ class ClearSessionResponse(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    session_id: str = Field(..., description="Unique identifier for the chat session.")
-    message: str = Field(..., description="The user's message.")
+    session_id: str = Field(...)
+    message: str = Field(...)
+    locale: Optional[str] = Field(None)
+    # Add option to enable/disable RAG for individual requests
+    use_rag: Optional[bool] = Field(None, description="Override the default RAG setting")
 
 
 class ChatResponse(BaseModel):
     session_id: str
+    locale_used: str
     response: str
 
 
 class HealthResponse(BaseModel):
     status: str = "ok"
     model_name: str
+    embeddings_model: str
     ollama_url_used: str
     ollama_temperature: float
+    default_locale: str
+    available_personas: List[str]
+    rag_status: str
+    rag_enabled_by_default: bool
+    rag_available: bool
+
+
+# --- Direct LLM Chain Function ---
+def create_direct_llm_chain(llm_model: OllamaLLM) -> Any:
+    """Creates a chain that sends messages directly to the LLM without retrieval."""
+    logger.debug("Creating direct LLM chain without RAG")
+    prompt = ChatPromptTemplate.from_messages([
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+    return prompt | llm_model | StrOutputParser()
+
+
+# --- RAG Chain Creation Functions ---
+def create_rag_retriever(vs: FAISS, k: int = 3) -> Any:
+    return vs.as_retriever(search_kwargs={"k": k})
+
+
+def create_history_aware_retriever_chain(llm_model: OllamaLLM, rag_retriever: Any) -> Any:
+    contextualize_q_system_prompt = (
+        "Given a chat history and the latest user question "
+        "which might reference context in the chat history, "
+        "formulate a standalone question which can be understood "
+        "without the chat history. Do NOT answer the question, "
+        "just reformulate it if needed and otherwise return it as is."
+    )
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", contextualize_q_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    history_aware_retriever_runnable = create_history_aware_retriever(
+        llm_model, rag_retriever, contextualize_q_prompt
+    )
+    return history_aware_retriever_runnable
+
+
+def create_document_question_chain(llm_model: OllamaLLM, persona_specific_system_prompt: str) -> Any:
+    qa_system_template = f"""{persona_specific_system_prompt}
+
+You will be provided with relevant context based on the user's question and chat history.
+Use this context to inform your answer, but maintain your Healvana persona, tone, and interaction guidelines (especially the 10-15 word limit and asking questions).
+If the context doesn't provide a direct answer, rely on your clinical knowledge base while still adhering to the persona.
+Do not mention the context explicitly unless it's natural within the persona (e.g., referencing a specific coping strategy discussed).
+
+Context:
+{{context}}"""
+
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", qa_system_template),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    # Add document_variable_name parameter to match the placeholder in the template
+    question_answer_chain = create_stuff_documents_chain(
+        llm_model,
+        qa_prompt,
+        document_variable_name="context"  # This must match the {context} in the template
+    )
+    return question_answer_chain
 
 
 # --- Helper Functions ---
-def get_session_memory(session_id: str, create_if_not_exists: bool = True) -> Optional[ConversationBufferMemory]:
-    """
-    Retrieves or creates a ConversationBufferMemory for a given session ID.
-    If create_if_not_exists is True and memory doesn't exist, it's initialized with the Healvana persona.
-    Returns None if memory doesn't exist and create_if_not_exists is False.
-    """
+def get_session_history(session_id: str, locale: Optional[str] = None, create_if_not_exists: bool = True) -> Tuple[
+    List[BaseMessage], str]:
     global settings
-    if session_id not in session_memories and create_if_not_exists:
-        logger.info(f"Creating new memory and Healvana persona for session: {session_id}")
-        new_memory = ConversationBufferMemory(
-            memory_key="history",
-            return_messages=True
-        )
+    effective_locale = locale or settings.default_locale
 
-        system_message = SystemMessage(content=settings.healvana_system_prompt)
-        new_memory.chat_memory.add_message(system_message)
+    if session_id not in session_histories and create_if_not_exists:
+        logger.info(f"Creating new history for session: {session_id} with locale: {effective_locale}")
+        persona_config = settings.get_persona_config(effective_locale)
+        session_histories[session_id] = [
+            SystemMessage(content=persona_config.system_prompt),
+            AIMessage(content=persona_config.initial_greeting)
+        ]
+    elif session_id not in session_histories and not create_if_not_exists:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found.")
 
-        ai_greeting = AIMessage(content=settings.healvana_initial_greeting)
-        new_memory.chat_memory.add_message(ai_greeting)
+    current_session_locale = effective_locale
+    if session_id in session_histories and session_histories[session_id]:
+        first_message = session_histories[session_id][0]
+        if isinstance(first_message, SystemMessage):
+            for loc_id, p_conf in settings.personas.items():
+                if p_conf.system_prompt == first_message.content:
+                    current_session_locale = loc_id
+                    break
 
-        session_memories[session_id] = new_memory
-    elif session_id not in session_memories and not create_if_not_exists:
-        return None
-
-    return session_memories.get(session_id)
+    return session_histories.get(session_id, []), current_session_locale
 
 
-# --- FastAPI Lifespan Events ---
+def clear_session_history_func(session_id: str) -> bool:
+    if session_id in session_histories:
+        del session_histories[session_id]
+        logger.info(f"Cleared in-memory history for session: {session_id}")
+        return True
+    return False
+
+
+# --- FastAPI Lifespan & App Initialization ---
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
-    global llm, settings
+    global llm, embeddings, vector_store, retriever, settings
+    rag_status = "Not Initialized"
+    rag_available = False
+
     logger.info("Application startup...")
     logger.info(
-        f"Using settings (excluding system prompt): {settings.model_dump(exclude_none=True, exclude={'healvana_system_prompt'})}")
+        f"Using settings (excluding persona details): {settings.model_dump(exclude_none=True, exclude={'personas'})}")
 
-    if not settings.ollama_model:
-        logger.error("OLLAMA_MODEL environment variable is not set or empty.")
-        raise EnvironmentError("OLLAMA_MODEL environment variable is not set or empty.")
+    if not settings.ollama_model: raise EnvironmentError("OLLAMA_MODEL missing.")
+    if not settings.actual_ollama_base_url: raise EnvironmentError("Ollama base URL could not be determined.")
 
-    if not settings.actual_ollama_base_url:
-        logger.error("Ollama base URL could not be determined.")
-        raise EnvironmentError("Ollama base URL could not be determined.")
-
+    # Initialize LLM first - this is required regardless of RAG status
     logger.info(
-        f"Initializing Ollama LLM with model: {settings.ollama_model}, "
-        f"URL: {settings.actual_ollama_base_url}, "
-        f"Temperature: {settings.ollama_temperature}"
-    )
+        f"Initializing Ollama LLM: model={settings.ollama_model}, url={settings.actual_ollama_base_url}, temp={settings.ollama_temperature}")
     try:
         llm = OllamaLLM(
             model=settings.ollama_model,
@@ -259,81 +380,197 @@ async def lifespan(app_instance: FastAPI):
         logger.info("LLM initialized successfully.")
     except Exception as e:
         logger.exception(f"FATAL: Failed to initialize OllamaLLM: {e}")
-        raise RuntimeError(f"LLM initialization failed: {e}") from e
+        llm = None
+
+    # Only initialize RAG components if LLM is available
+    if llm:
+        try:
+            # Initialize Embeddings and check for documents regardless of enable_rag_by_default
+            # This allows us to know if RAG is available even if not enabled by default
+            logger.info(
+                f"Checking RAG availability: Initializing Ollama Embeddings: model={settings.embeddings_model}, url={settings.actual_ollama_base_url}")
+            embeddings = OllamaEmbeddings(model=settings.embeddings_model, base_url=settings.actual_ollama_base_url)
+
+            current_script_dir = Path(__file__).parent
+            effective_documents_dir = current_script_dir / DOCUMENTS_DIR
+
+            # Check if documents directory exists and has documents
+            if not effective_documents_dir.is_dir():
+                logger.warning(
+                    f"Documents directory '{effective_documents_dir}' not found. RAG will be unavailable unless documents are added.")
+                docs = []
+            else:
+                logger.info(f"Checking for documents in: {effective_documents_dir}")
+                loader = DirectoryLoader(str(effective_documents_dir), glob="**/*.txt", loader_cls=TextLoader,
+                                         show_progress=True, use_multithreading=False)
+                docs = loader.load()
+                logger.info(f"Found {len(docs)} documents for potential RAG usage.")
+
+            # If we have documents or settings say to initialize RAG regardless
+            if docs or settings.enable_rag_by_default:
+                logger.info("Initializing vector store and retriever for RAG...")
+                if not docs:
+                    logger.warning("No documents loaded. Vector store will be minimal with placeholder documents.")
+                    vector_store = FAISS.from_texts(
+                        [
+                            "No external documents available for Healvana's knowledge base at this time. Rely on your general knowledge and persona training."],
+                        embeddings
+                    )
+                else:
+                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                    splits = text_splitter.split_documents(docs)
+                    logger.info(f"Split documents into {len(splits)} chunks.")
+                    logger.info("Creating FAISS vector store...")
+                    vector_store = FAISS.from_documents(splits, embeddings)
+                    logger.info("FAISS vector store created successfully.")
+
+                retriever = create_rag_retriever(vector_store, k=3)
+                logger.info("Retriever created successfully.")
+                rag_status = f"RAG Initialized with {len(docs)} documents" if docs else "RAG Initialized with placeholder document"
+                rag_available = True
+            else:
+                logger.info("No documents found and RAG not enabled by default. RAG components not initialized.")
+                rag_status = "RAG Not Initialized (No documents and not enabled by default)"
+                rag_available = False
+        except Exception as e:
+            logger.exception(f"ERROR: Failed to initialize RAG components: {e}")
+            rag_status = f"RAG Error: {e}"
+            retriever = None
+            vector_store = None
+            embeddings = None
+            rag_available = False
+    else:
+        rag_status = "RAG SKIPPED: LLM initialization failed."
+        logger.error(rag_status)
+        rag_available = False
+
+    # Store RAG status in app state
+    app_instance.state.rag_status = rag_status
+    app_instance.state.rag_available = rag_available
+
+    logger.info(f"Application startup complete. RAG status: {rag_status}")
+
     yield
+
     logger.info("Application shutdown...")
-    session_memories.clear()
-    logger.info("Cleared session memories.")
+    session_histories.clear()
+    logger.info("Cleared in-memory session histories.")
 
 
-# --- FastAPI Application ---
+# --- FastAPI App ---
 app = FastAPI(
     title=settings.app_title,
     version=settings.app_version,
-    description="A comprehensive chat interface powered by LangChain + Ollama, with Healvana persona and session management.",
+    description="A comprehensive, global-ready chat API with localized Healvana personas and optional RAG.",
     lifespan=lifespan
 )
-
-# --- CORS Middleware ---
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS", "DELETE"],  # Added DELETE
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS", "DELETE"], allow_headers=["*"],
 )
 
 
 # --- API Endpoints ---
-
-# --- Management Endpoints ---
 @app.get("/health", response_model=HealthResponse, tags=["Management"])
 async def health_check():
-    if not llm or not settings or not settings.actual_ollama_base_url:
-        raise HTTPException(status_code=503, detail="Service Unavailable: LLM or settings not initialized.")
+    rag_status = app.state.rag_status if hasattr(app.state, 'rag_status') else "Unknown"
+    rag_available = app.state.rag_available if hasattr(app.state, 'rag_available') else False
+
     return HealthResponse(
-        status="ok",
+        status="ok" if llm else "degraded",
         model_name=settings.ollama_model,
-        ollama_url_used=settings.actual_ollama_base_url,
-        ollama_temperature=settings.ollama_temperature
+        embeddings_model=settings.embeddings_model,
+        ollama_url_used=str(settings.actual_ollama_base_url),
+        ollama_temperature=settings.ollama_temperature,
+        default_locale=settings.default_locale,
+        available_personas=list(settings.personas.keys()),
+        rag_status=rag_status,
+        rag_enabled_by_default=settings.enable_rag_by_default,
+        rag_available=rag_available
     )
 
 
-@app.get("/config/persona", response_model=PersonaConfigResponse, tags=["Management"])
-async def get_persona_configuration():
-    """Retrieves the current Healvana system prompt and initial greeting."""
-    if not settings:
-        raise HTTPException(status_code=503, detail="Settings not initialized.")
-    return PersonaConfigResponse(
-        system_prompt=settings.healvana_system_prompt,
-        initial_greeting=settings.healvana_initial_greeting
-    )
+@app.get("/config/personas", response_model=List[PersonaInfo], tags=["Management"])
+async def list_available_personas():
+    return [PersonaInfo(locale_id=lc, persona_name=pc.persona_name) for lc, pc in settings.personas.items()]
 
 
-# --- Chat Interaction Endpoints ---
+@app.get("/config/personas/{locale_id}", response_model=PersonaDetailResponse, tags=["Management"])
+async def get_persona_details(locale_id: str = FastApiPath(..., description="The locale ID (e.g., en-US).")):
+    persona_config = settings.personas.get(locale_id)
+    if not persona_config:
+        raise HTTPException(status_code=404, detail=f"Persona for locale '{locale_id}' not found.")
+    return persona_config
+
+
+# --- Chat Interaction Endpoints (Modified for Optional RAG) ---
+async def get_locale_specific_rag_chain(active_locale: str) -> Any:
+    """Dynamically assembles the RAG chain with the locale-specific system prompt."""
+    global llm, retriever, settings
+    if not llm or not retriever:
+        logger.error(
+            f"get_locale_specific_rag_chain: LLM is {'set' if llm else 'None'}, Retriever is {'set' if retriever else 'None'}")
+        raise HTTPException(status_code=503, detail="Core RAG components not ready.")
+
+    persona_config = settings.get_persona_config(active_locale)
+
+    history_aware_retriever_chain_runnable = create_history_aware_retriever_chain(llm, retriever)
+    question_answer_chain_runnable = create_document_question_chain(llm, persona_config.system_prompt)
+
+    return create_retrieval_chain(history_aware_retriever_chain_runnable, question_answer_chain_runnable)
+
+
 @app.post("/chat", response_model=ChatResponse, tags=["Chat Interaction"])
 async def chat_endpoint(request: ChatRequest = Body(...)):
     if not llm:
-        logger.error("LLM not available for /chat request.")
         raise HTTPException(status_code=503, detail="LLM not available.")
 
-    logger.info(f"Received chat request for session: {request.session_id} with message: '{request.message[:50]}...'")
-    try:
-        memory = get_session_memory(request.session_id, create_if_not_exists=True)
-        if not memory:  # Should not happen if create_if_not_exists is True
-            raise HTTPException(status_code=404,
-                                detail=f"Session {request.session_id} memory could not be initialized.")
+    # Determine if RAG should be used for this request
+    use_rag = request.use_rag if request.use_rag is not None else settings.enable_rag_by_default
+    rag_available = app.state.rag_available if hasattr(app.state, 'rag_available') else False
 
-        chat_history_messages = memory.load_memory_variables({})['history']
-        messages_for_llm = chat_history_messages + [HumanMessage(content=request.message)]
-        ai_response_str = await llm.ainvoke(messages_for_llm)
-        memory.save_context(
-            {"input": request.message},
-            {"output": ai_response_str}
-        )
-        logger.info(
-            f"Successfully processed chat for session: {request.session_id}. Response length: {len(ai_response_str)}")
-        return ChatResponse(session_id=request.session_id, response=ai_response_str)
+    # If RAG is requested but not available, log a warning and fall back to direct LLM
+    if use_rag and not rag_available:
+        logger.warning(f"RAG requested for session {request.session_id} but not available. Falling back to direct LLM.")
+        use_rag = False
+
+    active_locale = request.locale or settings.default_locale
+    logger.info(
+        f"Chat request for session: {request.session_id}, locale: {active_locale}, use_rag: {use_rag}, message: '{request.message[:50]}...'")
+
+    history, locale_used_for_session = get_session_history(request.session_id, locale=active_locale,
+                                                           create_if_not_exists=True)
+
+    try:
+        ai_response_str = ""
+
+        if use_rag:
+            # RAG path
+            logger.debug(f"Using RAG for session {request.session_id}")
+            current_rag_chain = await get_locale_specific_rag_chain(active_locale)
+            response = await current_rag_chain.ainvoke({
+                "input": request.message,
+                "chat_history": history[1:]  # Pass history *without* the initial SystemMessage
+            })
+            ai_response_str = response.get("answer", "Sorry, I couldn't generate a response.")
+        else:
+            # Direct LLM path
+            logger.debug(f"Using direct LLM (no RAG) for session {request.session_id}")
+            direct_chain = create_direct_llm_chain(llm)
+            ai_response_str = await direct_chain.ainvoke({
+                "input": request.message,
+                "chat_history": history  # Include the full history with SystemMessage
+            })
+
+        # Update history (append user message and AI response)
+        updated_history = history + [
+            HumanMessage(content=request.message),
+            AIMessage(content=ai_response_str)
+        ]
+        session_histories[request.session_id] = updated_history
+        logger.debug(f"History updated for session {request.session_id}. Response length: {len(ai_response_str)}")
+
+        return ChatResponse(session_id=request.session_id, locale_used=active_locale, response=ai_response_str)
     except Exception as e:
         logger.exception(f"Error processing chat for session {request.session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
@@ -342,94 +579,130 @@ async def chat_endpoint(request: ChatRequest = Body(...)):
 @app.post("/chat/stream", tags=["Chat Interaction"])
 async def chat_stream_endpoint(request: ChatRequest = Body(...)):
     if not llm:
-        logger.error("LLM not available for /chat/stream request.")
         raise HTTPException(status_code=503, detail="LLM not available.")
 
+    # Determine if RAG should be used for this request
+    use_rag = request.use_rag if request.use_rag is not None else settings.enable_rag_by_default
+    rag_available = app.state.rag_available if hasattr(app.state, 'rag_available') else False
+
+    # If RAG is requested but not available, log a warning and fall back to direct LLM
+    if use_rag and not rag_available:
+        logger.warning(
+            f"RAG requested for streaming session {request.session_id} but not available. Falling back to direct LLM.")
+        use_rag = False
+
+    active_locale = request.locale or settings.default_locale
     logger.info(
-        f"Received streaming chat request for session: {request.session_id} with message: '{request.message[:50]}...'")
+        f"Streaming request for session: {request.session_id}, locale: {active_locale}, use_rag: {use_rag}, message: '{request.message[:50]}...'")
 
-    memory = get_session_memory(request.session_id, create_if_not_exists=True)
-    if not memory:  # Should not happen
-        raise HTTPException(status_code=404, detail=f"Session {request.session_id} memory could not be initialized.")
-
-    chat_history_messages = memory.load_memory_variables({})['history']
-    messages_for_llm = chat_history_messages + [HumanMessage(content=request.message)]
+    history, locale_used_for_session = get_session_history(request.session_id, locale=active_locale,
+                                                           create_if_not_exists=True)
 
     async def stream_generator() -> AsyncGenerator[str, None]:
         full_response_content = ""
-        try:
-            logger.debug(f"Starting LLM stream for session {request.session_id}")
-            async for str_chunk in llm.astream(messages_for_llm):
-                token = str_chunk
-                if token:
-                    full_response_content += token
-                    escaped_token = token.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r',
-                                                                                                                 '\\r')
-                    yield f"data: {{\"token\": \"{escaped_token}\"}}\n\n"
+        last_chunk = None  # Initialize last_chunk to handle the case where no chunks are generated
 
-            yield f"data: {{\"end_stream\": true, \"session_id\": \"{request.session_id}\"}}\n\n"
-            logger.info(
-                f"Stream ended for session: {request.session_id}. Total response length: {len(full_response_content)}")
-            memory.save_context({"input": request.message}, {"output": full_response_content})
-            logger.info(f"Memory updated for session: {request.session_id} after streaming.")
+        try:
+            if use_rag:
+                # RAG path
+                logger.debug(f"Using RAG for streaming session {request.session_id}")
+                current_rag_chain = await get_locale_specific_rag_chain(active_locale)
+
+                # Stream the response from the RAG chain
+                async for chunk in current_rag_chain.astream({
+                    "input": request.message,
+                    "chat_history": history[1:]  # Pass history *without* the initial SystemMessage
+                }):
+                    last_chunk = chunk  # Save the last chunk for potential fallback
+                    if "answer" in chunk and chunk["answer"] is not None:
+                        token = chunk["answer"]
+                        if isinstance(token, str):
+                            full_response_content += token
+                            escaped_token = token.replace('\\', '\\\\').replace('"', '\\"').replace('\n',
+                                                                                                    '\\n').replace('\r',
+                                                                                                                   '\\r')
+                            yield f"data: {{\"token\": \"{escaped_token}\", \"locale_used\": \"{active_locale}\"}}\n\n"
+            else:
+                # Direct LLM path
+                logger.debug(f"Using direct LLM (no RAG) for streaming session {request.session_id}")
+                direct_chain = create_direct_llm_chain(llm)
+
+                # Stream the response from the direct LLM chain
+                async for token in direct_chain.astream({
+                    "input": request.message,
+                    "chat_history": history  # Include the full history with SystemMessage
+                }):
+                    if isinstance(token, str):
+                        full_response_content += token
+                        escaped_token = token.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace(
+                            '\r', '\\r')
+                        yield f"data: {{\"token\": \"{escaped_token}\", \"locale_used\": \"{active_locale}\"}}\n\n"
+
+            # Fallback if streaming didn't yield individual tokens (e.g. full answer in last chunk)
+            if not full_response_content and last_chunk is not None and "answer" in last_chunk and isinstance(
+                    last_chunk["answer"], str):
+                logger.debug(f"Using fallback for session {request.session_id} as no tokens were streamed")
+                full_response_content = last_chunk["answer"]
+                # No need to yield again if it was already yielded as the last token
+
+            yield f"data: {{\"end_stream\": true, \"session_id\": \"{request.session_id}\", \"locale_used\": \"{active_locale}\"}}\n\n"
+
+            if full_response_content:
+                # Get the latest history state before appending
+                final_history_state, _ = get_session_history(request.session_id, create_if_not_exists=False)
+                final_history_state.append(HumanMessage(content=request.message))
+                final_history_state.append(AIMessage(content=full_response_content))
+                session_histories[request.session_id] = final_history_state
+                logger.info(
+                    f"History updated for session {request.session_id} after stream. Response length: {len(full_response_content)}")
+            else:
+                logger.warning(f"No content was generated or streamed for session {request.session_id}.")
+
         except Exception as e:
             logger.exception(f"Error during streaming for session {request.session_id}: {e}")
             escaped_error = str(e).replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
-            yield f"data: {{\"error\": \"{escaped_error}\", \"session_id\": \"{request.session_id}\"}}\n\n"
+            yield f"data: {{\"error\": \"{escaped_error}\", \"session_id\": \"{request.session_id}\", \"locale_used\": \"{active_locale}\"}}\n\n"
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
 
 # --- Session Management Endpoints ---
 @app.get("/chat/sessions/{session_id}/history", response_model=SessionHistoryResponse, tags=["Session Management"])
-async def get_session_chat_history(
-        session_id: str = Path(..., description="The ID of the session to retrieve history for.")):
-    """Retrieves the conversation history for a specific session."""
-    memory = get_session_memory(session_id, create_if_not_exists=False)  # Don't create if just fetching
-    if not memory:
-        raise HTTPException(status_code=404, detail=f"Session {session_id} not found or has no history.")
-
-    raw_messages = memory.load_memory_variables({})['history']
-    history_output = [MessageOutput.from_langchain_message(msg) for msg in raw_messages]
-
-    return SessionHistoryResponse(session_id=session_id, history=history_output)
+async def get_session_chat_history(session_id: str = FastApiPath(...)):
+    history_list, locale_used = get_session_history(session_id, create_if_not_exists=False)
+    history_output = [MessageOutput.from_langchain_message(msg) for msg in history_list]
+    return SessionHistoryResponse(session_id=session_id, locale_used=locale_used, history=history_output)
 
 
 @app.delete("/chat/sessions/{session_id}/history", response_model=ClearSessionResponse, tags=["Session Management"])
-async def clear_session_chat_history(session_id: str = Path(..., description="The ID of the session to clear.")):
-    """Clears the conversation history for a specific session. The session will be re-initialized on next use."""
-    if session_id in session_memories:
-        del session_memories[session_id]
-        logger.info(f"Cleared memory for session: {session_id}")
-        return ClearSessionResponse(session_id=session_id,
-                                    message="Session history cleared successfully. It will be re-initialized with persona on next interaction.")
+async def clear_session_chat_history_endpoint(session_id: str = FastApiPath(...)):
+    if clear_session_history_func(session_id):
+        return ClearSessionResponse(session_id=session_id, message="Session history cleared.")
     else:
-        logger.warning(f"Attempted to clear non-existent session: {session_id}")
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found.")
 
 
 @app.get("/chat/sessions/{session_id}/greeting", response_model=InitialGreetingResponse, tags=["Session Management"])
-async def get_initial_ai_greeting(session_id: str = Path(..., description="The ID of the session.")):
-    """
-    Gets Healvana's initial greeting. If the session is new, it initializes it.
-    Useful for UIs to display the greeting before the user's first message.
-    """
-    memory = get_session_memory(session_id, create_if_not_exists=True)  # Ensure session is created if new
-    if not memory:  # Should not happen with create_if_not_exists=True
-        raise HTTPException(status_code=500, detail="Failed to initialize session.")
-
-    # The greeting is always the second message after the system prompt in a new session
-    # Or, more robustly, just return the configured greeting directly as it's static for new sessions.
-    return InitialGreetingResponse(session_id=session_id, greeting=settings.healvana_initial_greeting)
+async def get_initial_ai_greeting(session_id: str = FastApiPath(...), locale: Optional[str] = None):
+    active_locale = locale or settings.default_locale
+    get_session_history(session_id, locale=active_locale, create_if_not_exists=True)
+    persona_config = settings.get_persona_config(active_locale)
+    return InitialGreetingResponse(session_id=session_id, locale_used=active_locale,
+                                   greeting=persona_config.initial_greeting)
 
 
 # --- Development Server Runner ---
 if __name__ == "__main__":
-    logger.info("Starting Uvicorn development server...")
+    # Ensure persona and document directories exist before starting
+    current_dir = Path(__file__).parent
+    if not (current_dir / PERSONA_DIR).exists():
+        (current_dir / PERSONA_DIR).mkdir(parents=True, exist_ok=True)
+        logger.info(f"Created missing persona directory: {current_dir / PERSONA_DIR}")
+    if not (current_dir / DOCUMENTS_DIR).exists():
+        (current_dir / DOCUMENTS_DIR).mkdir(parents=True, exist_ok=True)
+        logger.info(f"Created missing documents directory: {current_dir / DOCUMENTS_DIR}")
+
     uvicorn.run(
-        "__main__:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
+        "__main__:app", host="0.0.0.0", port=8000, reload=True,
         log_level=settings.log_level.lower()
     )

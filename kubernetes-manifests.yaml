@@ -1,0 +1,560 @@
+# kubernetes-manifests-prod.yaml
+
+# --- Namespace ---
+# All resources for the Healvana application will reside in this namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: healvana-ns # Application-specific namespace
+
+---
+# --- PersistentVolumeClaim for Ollama ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-pvc
+  namespace: healvana-ns # Added namespace
+  labels:
+    app: ollama
+    environment: production
+spec:
+  accessModes:
+    - ReadWriteOnce # Suitable for a single Ollama instance
+  resources:
+    requests:
+      storage: 20Gi # Increased storage for production models
+  # storageClassName: your-production-storage-class # Specify your production StorageClass
+
+---
+# --- ConfigMap for Langchain Service ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: langchain-config
+  namespace: healvana-ns
+  labels:
+    app: langchain
+    environment: production
+data:
+  OLLAMA_MODEL: "qwen2:0.5b" # Or your desired model
+  OLLAMA_HOST: "ollama-service"
+  OLLAMA_PORT: "11434"
+  OLLAMA_TEMPERATURE: "0.2"
+  LOG_LEVEL: "INFO"
+  # Add other non-sensitive configurations here
+
+---
+# --- ConfigMap for Web Service ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-config
+  namespace: healvana-ns
+  labels:
+    app: web
+    environment: production
+data:
+  VITE_API_HOST: "langchain-service" # Points to the Langchain Kubernetes Service
+  VITE_API_PORT: "8000" # Port for the Langchain service
+  # Add other frontend configurations here
+
+---
+# --- Ollama Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-deployment
+  namespace: healvana-ns
+  labels:
+    app: ollama
+    environment: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+      environment: production
+  strategy:
+    type: Recreate # Ollama with PVC might be better with Recreate to avoid issues with multiple pods trying to access the same volume if scaled (though it's 1 replica here)
+  template:
+    metadata:
+      labels:
+        app: ollama
+        environment: production
+      annotations:
+        prometheus.io/scrape: "true" # Example annotation for Prometheus
+        prometheus.io/port: "11434"
+    spec:
+      # serviceAccountName: ollama-sa # If you create a dedicated SA
+      securityContext:
+        runAsUser: 1000 # Example: run as non-root user
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest # Official Ollama image
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 11434
+              protocol: TCP
+          # envFrom: # Alternative to direct env, can use ConfigMap for some Ollama settings
+          #   - configMapRef:
+          #       name: ollama-config
+          volumeMounts:
+            - name: ollama-storage
+              mountPath: /root/.ollama
+          resources: # Define resource requests and limits
+            requests:
+              memory: "4Gi" # Adjust based on models loaded
+              cpu: "1"      # Adjust based on usage
+            limits:
+              memory: "8Gi" # Adjust based on models loaded
+              cpu: "2"      # Adjust based on usage
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 20 # Increased delay for model loading
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 60 # Increased delay
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: ollama-storage
+          persistentVolumeClaim:
+            claimName: ollama-pvc
+
+---
+# --- Ollama Service ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-service
+  namespace: healvana-ns
+  labels:
+    app: ollama
+    environment: production
+spec:
+  selector:
+    app: ollama
+    environment: production
+  ports:
+    - name: http
+      protocol: TCP
+      port: 11434
+      targetPort: http
+  type: ClusterIP
+
+---
+# --- Langchain (FastAPI Backend) Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langchain-deployment
+  namespace: healvana-ns
+  labels:
+    app: langchain
+    environment: production
+spec:
+  replicas: 2 # Start with 2 replicas for higher availability
+  selector:
+    matchLabels:
+      app: langchain
+      environment: production
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1 # Or 25%
+      maxSurge: 1       # Or 25%
+  template:
+    metadata:
+      labels:
+        app: langchain
+        environment: production
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics" # If your app exposes metrics here
+        prometheus.io/port: "8000"
+    spec:
+      # serviceAccountName: langchain-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001 # Example user ID
+        runAsGroup: 1001
+        # fsGroup: 1001 # If you have writable volumes
+      containers:
+        - name: langchain
+          image: your-org/langchain-healvana-api:latest # IMPORTANT: Replace with your image
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: langchain-config
+          # command: ["poetry", "run", "python", "serve.py"] # If not in Dockerfile CMD/ENTRYPOINT
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m" # 0.25 CPU core
+            limits:
+              memory: "1Gi"
+              cpu: "500m" # 0.5 CPU core
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20 # Allow time for app to start
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            timeoutSeconds: 5
+
+---
+# --- Langchain (FastAPI Backend) Service ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: langchain-service
+  namespace: healvana-ns
+  labels:
+    app: langchain
+    environment: production
+spec:
+  selector:
+    app: langchain
+    environment: production
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8000
+      targetPort: http
+  type: ClusterIP
+
+---
+# --- Langchain HorizontalPodAutoscaler ---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: langchain-hpa
+  namespace: healvana-ns
+  labels:
+    app: langchain
+    environment: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: langchain-deployment
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70 # Target 70% CPU utilization
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75 # Target 75% Memory utilization
+
+
+---
+# --- Langchain PodDisruptionBudget ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: langchain-pdb
+  namespace: healvana-ns
+  labels:
+    app: langchain
+    environment: production
+spec:
+  minAvailable: 1 # Or e.g., "50%"
+  selector:
+    matchLabels:
+      app: langchain
+      environment: production
+
+---
+# --- Web (Frontend) Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-deployment
+  namespace: healvana-ns
+  labels:
+    app: web
+    environment: production
+spec:
+  replicas: 2 # Start with 2 replicas
+  selector:
+    matchLabels:
+      app: web
+      environment: production
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: web
+        environment: production
+    spec:
+      # serviceAccountName: web-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1002 # Example user ID, ensure your image supports this
+        runAsGroup: 1002
+      containers:
+        - name: web
+          image: your-org/web-frontend-healvana:latest # IMPORTANT: Replace with your image
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 80 # Assuming your web app (e.g., Nginx serving Svelte build) serves on port 80
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: web-config
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+          readinessProbe:
+            httpGet:
+              path: / # Health check for your frontend
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+
+---
+# --- Web (Frontend) Service (ClusterIP for Ingress) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+  namespace: healvana-ns
+  labels:
+    app: web
+    environment: production
+spec:
+  selector:
+    app: web
+    environment: production
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80 # Service port
+      targetPort: http # Container port name
+  type: ClusterIP # Exposed via Ingress
+
+---
+# --- Web HorizontalPodAutoscaler ---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-hpa
+  namespace: healvana-ns
+  labels:
+    app: web
+    environment: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-deployment
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+# --- Web PodDisruptionBudget ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-pdb
+  namespace: healvana-ns
+  labels:
+    app: web
+    environment: production
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: web
+      environment: production
+
+---
+# --- Ingress for Web Frontend ---
+# Requires an Ingress controller (e.g., Nginx, Traefik) to be installed in your cluster.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: healvana-ingress
+  namespace: healvana-ns
+  labels:
+    app: web
+    environment: production
+  annotations:
+    # Example for Nginx Ingress Controller:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod" # If using cert-manager for TLS
+spec:
+  # tls: # Uncomment and configure for HTTPS
+  # - hosts:
+  #     - healvana.yourdomain.com
+  #   secretName: healvana-tls-secret # Secret containing your TLS cert and key
+  rules:
+    - host: healvana.yourdomain.com # Replace with your actual domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-service # Points to the web frontend ClusterIP service
+                port:
+                  name: http # Or number: 80
+
+---
+# --- Network Policies ---
+
+# Allow Langchain to talk to Ollama
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-langchain-to-ollama
+  namespace: healvana-ns
+spec:
+  podSelector:
+    matchLabels:
+      app: ollama
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: langchain
+      ports:
+        - protocol: TCP
+          port: 11434 # Ollama port
+
+# Allow Web to talk to Langchain, and Langchain to egress to Ollama
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: langchain-network-policy
+  namespace: healvana-ns
+spec:
+  podSelector:
+    matchLabels:
+      app: langchain
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: # What can talk TO Langchain
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web # Allow traffic from Web frontend
+      ports:
+        - protocol: TCP
+          port: 8000 # Langchain port
+  egress: # What Langchain can talk TO
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ollama # Allow traffic to Ollama
+      ports:
+        - protocol: TCP
+          port: 11434
+    - to: # Allow DNS resolution
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+
+# Allow Ingress controller to talk to Web frontend
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-web
+  namespace: healvana-ns
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  ingress:
+    - from: # Adjust this based on your Ingress controller's namespace and labels
+        - namespaceSelector:
+            matchLabels:
+              # Example: For nginx-ingress, the namespace might be 'ingress-nginx'
+              # and pods might have a label like 'app.kubernetes.io/name: ingress-nginx'
+              name: ingress-nginx # Replace with your Ingress controller's namespace
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx # Replace with your Ingress controller's pod labels
+      ports:
+        - protocol: TCP
+          port: 80 # Web frontend port
+  egress: # Allow web to talk to langchain
+    - to:
+        - podSelector:
+            matchLabels:
+              app: langchain
+      ports:
+        - protocol: TCP
+          port: 8000
+    - to: # Allow DNS resolution
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+

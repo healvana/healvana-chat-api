@@ -7,7 +7,7 @@
     text: string;
     sender: 'user' | 'ai';
     timestamp: Date;
-    streaming?: boolean; // Optional: to indicate if AI message is still streaming
+    streaming?: boolean;
   }
 
   // Reactive variables for the chat state
@@ -16,61 +16,96 @@
   let isLoading: boolean = false;
   let sessionId: string = '';
   let errorMessage: string | null = null;
-  let chatContainerElement: HTMLElement; // For auto-scrolling
+  let chatContainerElement: HTMLElement;
 
-  // Agent Name State
-  let agentNameInput: string = 'Local Assistant'; // Default agent name suggestion
-  let agentName: string | null = null;
-  let isSettingAgentName: boolean = true; // Start by asking for agent name
+  // Persona and Locale State
+  let agentName: string | null = "Healvana"; // Default, will be updated
+  let currentLocale: string = 'en-US'; // Default locale, ensure this persona exists on backend
 
   // API Configuration
-  const API_BASE_URL = 'http://localhost:8000'; // Your FastAPI backend URL
+  const API_BASE_URL = 'http://localhost:8000';
 
-  // Generate a unique session ID when the component mounts
   onMount(() => {
     sessionId = crypto.randomUUID();
-    // Check if an agent name was previously set for this session (optional persistence)
-    const storedAgentName = localStorage.getItem(`agentName-${sessionId}`);
-    if (storedAgentName) {
-      agentName = storedAgentName;
-      isSettingAgentName = false; // Skip asking if already set
-      loadMessages(); // Load messages if agent name is already set
-    }
-    scrollToBottom();
+    initializeSession();
   });
 
-  async function loadMessages() {
-    const storedMessages = localStorage.getItem(`chatMessages-${sessionId}`);
-    if (storedMessages) {
-      messages = JSON.parse(storedMessages).map((msg: Message) => ({...msg, timestamp: new Date(msg.timestamp) }));
-    }
-  }
-
-  // Function to handle setting the agent's name
-  function handleSetAgentName() {
-    const trimmedAgentName = agentNameInput.trim();
-    if (!trimmedAgentName) {
-      errorMessage = "Agent name cannot be empty.";
-      return;
-    }
-    agentName = trimmedAgentName;
-    isSettingAgentName = false;
+  async function initializeSession() {
+    isLoading = true;
     errorMessage = null;
-    localStorage.setItem(`agentName-${sessionId}`, agentName); // Optional: persist agent name
-    loadMessages(); // Load messages now that agent name is set
-    scrollToBottom();
+    const storedMessages = localStorage.getItem(`chatMessages-${sessionId}`);
+    const storedAgentName = localStorage.getItem(`agentName-${sessionId}`);
+
+    if (storedMessages && storedAgentName) {
+      agentName = storedAgentName;
+      messages = JSON.parse(storedMessages).map((msg: Message) => ({...msg, timestamp: new Date(msg.timestamp) }));
+      isLoading = false;
+      await tick(); // Ensure DOM is updated before scrolling
+      scrollToBottom();
+    } else {
+      await fetchInitialGreetingAndPersona();
+    }
   }
 
+  async function fetchInitialGreetingAndPersona() {
+    try {
+      // Fetch persona details to get the agent name
+      const personaResponse = await fetch(`${API_BASE_URL}/config/personas/${currentLocale}`);
+      if (!personaResponse.ok) {
+        const errorData = await personaResponse.json().catch(() => ({ detail: `Failed to load persona for ${currentLocale}`}));
+        throw new Error(errorData.detail || `HTTP error! status: ${personaResponse.status}`);
+      }
+      const personaData = await personaResponse.json();
+      agentName = personaData.persona_name || `Healvana (${currentLocale})`;
+      localStorage.setItem(`agentName-${sessionId}`, agentName);
 
-  // Function to scroll to the bottom of the chat container
+      // Fetch initial greeting
+      const greetingResponse = await fetch(`${API_BASE_URL}/chat/sessions/${sessionId}/greeting?locale=${currentLocale}`);
+      if (!greetingResponse.ok) {
+        const errorData = await greetingResponse.json().catch(() => ({ detail: "Failed to load initial greeting."}));
+        throw new Error(errorData.detail || `HTTP error! status: ${greetingResponse.status}`);
+      }
+      const greetingData = await greetingResponse.json();
+
+      const initialAiMessage: Message = {
+        id: crypto.randomUUID(),
+        text: greetingData.greeting,
+        sender: 'ai',
+        timestamp: new Date(),
+        streaming: false,
+      };
+      messages = [initialAiMessage];
+      localStorage.setItem(`chatMessages-${sessionId}`, JSON.stringify(messages));
+
+    } catch (error: any) {
+      console.error('Failed to initialize session:', error);
+      errorMessage = error.message || 'Could not initialize chat session.';
+      // Provide a fallback generic greeting if API fails
+      if (messages.length === 0) {
+        const fallbackGreeting: Message = {
+            id: crypto.randomUUID(),
+            text: "Hello! I'm Healvana. How can I help you today?",
+            sender: 'ai',
+            timestamp: new Date(),
+            streaming: false,
+        };
+        messages = [fallbackGreeting];
+        agentName = `Healvana (${currentLocale})`; // Fallback name
+      }
+    } finally {
+      isLoading = false;
+      await tick();
+      scrollToBottom();
+    }
+  }
+
   async function scrollToBottom() {
-    await tick(); // Wait for DOM updates
+    await tick();
     if (chatContainerElement) {
       chatContainerElement.scrollTop = chatContainerElement.scrollHeight;
     }
   }
 
-  // Function to handle sending a message
   async function sendMessage() {
     const trimmedMessage = currentMessageText.trim();
     if (!trimmedMessage || isLoading) return;
@@ -108,6 +143,7 @@
         body: JSON.stringify({
           session_id: sessionId,
           message: trimmedMessage,
+          locale: currentLocale, // Send the current locale
         }),
       });
 
@@ -157,7 +193,7 @@
               } else if (data.error) {
                 errorMessage = `Stream error: ${data.error}`;
                 messages = messages.map(msg =>
-                  msg.id === aiMessageId ? { ...msg, text: `Error: ${data.error}`, streaming: false, sender: 'ai' } : msg
+                  msg.id === aiMessageId ? { ...msg, text: `Error: ${data.error}`, streaming: false } : msg
                 );
                 isLoading = false;
                 break;
@@ -168,8 +204,9 @@
           }
           boundary = buffer.indexOf('\n\n');
         }
-         if (isLoading === false) break;
+         if (isLoading === false) break; // Exit outer while if stream ended
       }
+      // Ensure streaming flag is cleared if loop finishes unexpectedly while isLoading
       if (isLoading) {
         messages = messages.map(msg => msg.id === aiMessageId ? { ...msg, streaming: false } : msg);
         isLoading = false;
@@ -183,6 +220,7 @@
       );
       isLoading = false;
     } finally {
+      // Ensure loading is always set to false
       if (isLoading) {
          messages = messages.map(msg => msg.id === aiMessageId ? { ...msg, streaming: false } : msg);
          isLoading = false;
@@ -199,45 +237,24 @@
     }
   }
 
-  function handleAgentNameKeydown(event: KeyboardEvent) {
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      handleSetAgentName();
-    }
-  }
-
   function formatTime(date: Date) {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 </script>
 
 <div class="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-slate-900 to-slate-700 text-white p-4">
-  {#if isSettingAgentName}
+  {#if isLoading && messages.length === 0}
     <div class="w-full max-w-md bg-slate-800 shadow-2xl rounded-xl p-8 text-center">
-      <h1 class="text-2xl font-semibold mb-6">Name Your Chat Agent</h1>
-      <input
-        type="text"
-        bind:value={agentNameInput}
-        on:keydown={handleAgentNameKeydown}
-        placeholder="E.g., My Assistant"
-        class="w-full p-3 mb-4 bg-slate-700 text-slate-100 rounded-lg focus:ring-2 focus:ring-sky-500 focus:outline-none placeholder-slate-400"
-      />
-      <button
-        on:click={handleSetAgentName}
-        disabled={!agentNameInput.trim()}
-        class="w-full px-6 py-3 bg-sky-600 hover:bg-sky-700 text-white font-semibold rounded-lg focus:outline-none focus:ring-2 focus:ring-sky-500 focus:ring-offset-2 focus:ring-offset-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-150"
-      >
-        Start Chatting
-      </button>
-      {#if errorMessage && isSettingAgentName}
-        <p class="mt-4 text-red-400 text-sm">{errorMessage}</p>
-      {/if}
+      <h1 class="text-2xl font-semibold mb-6 animate-pulse">Initializing Healvana...</h1>
+      <p class="text-slate-400">Please wait a moment.</p>
     </div>
   {:else}
     <div class="w-full max-w-2xl flex flex-col h-[calc(100vh-4rem)] bg-slate-800 shadow-2xl rounded-xl overflow-hidden">
       <header class="bg-slate-900 p-4 text-center shadow-md">
-        <h1 class="text-2xl font-semibold">{agentName || 'Chat'}</h1>
-        <p class="text-xs text-slate-400">Session ID: {sessionId.substring(0,8)}...</p>
+        <h1 class="text-2xl font-semibold">{agentName || 'Healvana Chat'}</h1>
+        {#if sessionId}
+          <p class="text-xs text-slate-400">Session ID: {sessionId.substring(0,8)}...</p>
+        {/if}
       </header>
 
       <div bind:this={chatContainerElement} class="chat-messages-container flex-grow p-6 space-y-4 overflow-y-auto">
@@ -252,7 +269,7 @@
             >
               <p class="whitespace-pre-wrap break-words">
                 {message.text}
-                {#if message.streaming}
+                {#if message.streaming && message.sender === 'ai'}
                   <span class="inline-block w-1 h-4 bg-slate-300 ml-1 animate-pulse"></span>
                 {/if}
               </p>
@@ -262,7 +279,7 @@
             </div>
           </div>
         {/each}
-        {#if isLoading && messages[messages.length -1]?.sender !== 'ai' && messages[messages.length -1]?.streaming !== false}
+        {#if isLoading && messages.length > 0 && messages[messages.length -1]?.sender === 'user'}
           <div class="flex justify-start">
             <div class="max-w-[70%] p-3 rounded-lg shadow bg-slate-700 text-slate-100">
               <p class="animate-pulse">{agentName || 'AI'} is thinking...</p>
@@ -271,7 +288,7 @@
         {/if}
       </div>
 
-      {#if errorMessage && !isSettingAgentName}
+      {#if errorMessage}
         <div class="p-4 bg-red-500 text-white text-sm text-center">
           <p>Error: {errorMessage}</p>
         </div>
@@ -282,11 +299,10 @@
           <textarea
             rows="1"
             class="flex-grow p-3 bg-slate-700 text-slate-100 rounded-lg focus:ring-2 focus:ring-sky-500 focus:outline-none resize-none placeholder-slate-400"
-            placeholder="Type your message to {agentName || 'the assistant'}..."
+            placeholder="Type your message to {agentName || 'Healvana'}..."
             bind:value={currentMessageText}
             on:keydown={handleKeydown}
-            disabled={isLoading}
-          ></textarea>
+            disabled={isLoading && messages.length === 0} ></textarea>
           <button
             on:click={sendMessage}
             disabled={isLoading || !currentMessageText.trim()}
@@ -302,7 +318,7 @@
 
 <style>
   textarea {
-    min-height: 44px;
-    max-height: 150px;
+    min-height: 44px; /* approx height for 1 row with padding */
+    max-height: 150px; /* limit expansion */
   }
 </style>
