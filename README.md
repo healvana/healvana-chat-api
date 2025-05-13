@@ -1,4 +1,4 @@
-# Healvana Global Chat API with RAG
+# Healvana Chat API
 
 **Version:** -0.1.0
 
