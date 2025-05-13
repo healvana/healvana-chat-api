@@ -339,6 +339,12 @@ API documentation (Swagger UI) is available at `http://localhost:8000/docs` and 
       "greeting": "Hello, I'm Healvana, your mental wellness companion for the UK..."
     }
     ```
+# Healvana API
+
+This is the system-level API design:
+
+![API Diagram](api-diagram.png)
+
 
 ## RAG Details
 
